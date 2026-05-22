@@ -19,4 +19,4 @@ COPY . .
 
 EXPOSE 5000
 
-CMD ["sh", "-c", "gunicorn --timeout 180 --bind 0.0.0.0:${PORT:-5000} web_app:app"]
+CMD ["sh", "-c", "gunicorn --timeout 240 --bind 0.0.0.0:${PORT:-5000} web_app:app"]

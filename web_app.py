@@ -481,11 +481,23 @@ def index():
                 image_paths.append(image_path)
 
             output_capture = StringIO()
+            extractor = None
+            diagnostics = []
 
             with redirect_stdout(output_capture), redirect_stderr(output_capture):
                 extractor, diagnostics = process_uploaded_images(image_paths)
 
             if not extractor.trading_data:
+                captured_output = output_capture.getvalue().strip()
+                if captured_output:
+                    diagnostics.append(
+                        {
+                            "name": "OCR processing log",
+                            "message": "Internal messages from image processing.",
+                            "text": captured_output[-3000:],
+                        }
+                    )
+
                 return render_template_string(
                     PAGE,
                     error="No trading data could be extracted. Try a clearer image.",
