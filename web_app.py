@@ -22,7 +22,7 @@ from trading_data_analyzer import TradingDataExtractor
 
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif"}
-MAX_FILES_PER_REQUEST = 4
+MAX_FILES_PER_REQUEST = 7
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
