@@ -11,6 +11,7 @@ Then open the shown URL from a phone on the same Wi-Fi network.
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import os
+import traceback
 import tempfile
 from pathlib import Path
 
@@ -362,51 +363,61 @@ def build_results(extractor):
     }
 
 
+@app.route("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
-    if request.method == "GET":
-        return render_template_string(PAGE)
+    try:
+        if request.method == "GET":
+            return render_template_string(PAGE)
 
-    files = request.files.getlist("images")
-    files = [file for file in files if file and file.filename]
+        files = request.files.getlist("images")
+        files = [file for file in files if file and file.filename]
 
-    if not files:
-        return render_template_string(PAGE, error="Please choose at least one image.")
+        if not files:
+            return render_template_string(PAGE, error="Please choose at least one image.")
 
-    invalid_files = [file.filename for file in files if not is_allowed_file(file.filename)]
-    if invalid_files:
-        return render_template_string(
-            PAGE,
-            error=f"Unsupported file type: {', '.join(invalid_files)}",
-        )
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        image_paths = []
-
-        for index, uploaded_file in enumerate(files, start=1):
-            original_name = secure_filename(uploaded_file.filename)
-            if not original_name:
-                original_name = f"image_{index}.png"
-            image_path = temp_path / f"{index}_{original_name}"
-            uploaded_file.save(image_path)
-            image_paths.append(image_path)
-
-        extractor = TradingDataExtractor()
-        output_capture = StringIO()
-
-        with redirect_stdout(output_capture), redirect_stderr(output_capture):
-            processed = extractor.process_images(image_paths)
-
-        if not processed:
+        invalid_files = [file.filename for file in files if not is_allowed_file(file.filename)]
+        if invalid_files:
             return render_template_string(
                 PAGE,
-                error="No trading data could be extracted. Try a clearer image.",
+                error=f"Unsupported file type: {', '.join(invalid_files)}",
             )
 
-        results = build_results(extractor)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            image_paths = []
 
-    return render_template_string(PAGE, results=results)
+            for index, uploaded_file in enumerate(files, start=1):
+                original_name = secure_filename(uploaded_file.filename)
+                if not original_name:
+                    original_name = f"image_{index}.png"
+                image_path = temp_path / f"{index}_{original_name}"
+                uploaded_file.save(image_path)
+                image_paths.append(image_path)
+
+            extractor = TradingDataExtractor()
+            output_capture = StringIO()
+
+            with redirect_stdout(output_capture), redirect_stderr(output_capture):
+                processed = extractor.process_images(image_paths)
+
+            if not processed:
+                return render_template_string(
+                    PAGE,
+                    error="No trading data could be extracted. Try a clearer image.",
+                )
+
+            results = build_results(extractor)
+
+        return render_template_string(PAGE, results=results)
+    except Exception:
+        error = traceback.format_exc()
+        print(error, flush=True)
+        return render_template_string(PAGE, error=error), 500
 
 
 if __name__ == "__main__":
