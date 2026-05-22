@@ -273,11 +273,18 @@ class TradingDataExtractor:
           - Skip tokens that look like times (12:34) or dates (12/05).
           - For each row containing a BUY or SELL token, walk the words left-to-right and
             collect (index, value, has_decimal) for every numeric.
-          - Rate = the right-most decimal numeric (the price column is conventionally last).
-            Fallback: the right-most numeric if none have a decimal.
+          - Rate detection (column layout aware):
+              * If the row has >=2 decimal numerics, the trade-report layout is usually
+                `... Qty | Market Rate | Amount` where Amount = Qty * Market Rate. We test
+                this by walking integers to the left of the second-to-last decimal and
+                checking whether `int_value * second_to_last_decimal ~= last_decimal`
+                (2% tolerance). If verified, Rate = second-to-last decimal, Qty = that
+                integer.
+              * If only one decimal exists, Rate = that decimal.
+              * Otherwise Rate = right-most numeric (legacy fallback).
           - Quantity = the nearest INTEGER numeric immediately to the left of the rate.
             Fallback: the right-most numeric to the left of the rate, regardless of type.
-        This avoids picking an order-ID just because it happens to be the largest integer.
+        This avoids picking an Amount column or an order-ID as the rate / quantity.
         """
         trades = []
         considered = 0
@@ -308,30 +315,59 @@ class TradingDataExtractor:
                 skipped_reasons.append(f"row {row_idx}: only {len(numerics)} numeric token(s)")
                 continue
 
-            # Pick the rate: right-most decimal-looking number, else right-most number.
+            decimals = [e for e in numerics if e[3]]
+
+            # ---- pick rate (and possibly quantity together, when we can verify Qty*Rate=Amount)
             rate_entry = None
-            for entry in reversed(numerics):
-                if entry[3]:  # has_decimal
-                    rate_entry = entry
-                    break
-            if rate_entry is None:
+            quantity_entry = None
+
+            if len(decimals) >= 2:
+                # Try to match the `Qty | Rate | Amount` triple by arithmetic verification.
+                last_dec = decimals[-1]
+                second_last_dec = decimals[-2]
+                last_val = last_dec[2]
+                rate_val = second_last_dec[2]
+                # Walk integers left of the rate column, nearest first.
+                for entry in reversed(numerics):
+                    if entry[0] >= second_last_dec[0]:
+                        continue
+                    if entry[3]:
+                        continue  # integers only for qty candidate
+                    qty_val = entry[2]
+                    if qty_val <= 0 or last_val <= 0:
+                        continue
+                    expected = qty_val * rate_val
+                    if abs(expected - last_val) / last_val <= 0.02:
+                        rate_entry = second_last_dec
+                        quantity_entry = entry
+                        break
+
+                if rate_entry is None:
+                    # Arithmetic did not line up - fall back to right-most decimal.
+                    rate_entry = last_dec
+            elif len(decimals) == 1:
+                rate_entry = decimals[0]
+            else:
+                # No decimals at all - rate stays the right-most numeric (legacy behaviour).
                 rate_entry = numerics[-1]
 
             rate_pos = rate_entry[0]
-            # Pick the quantity: nearest integer to the LEFT of the rate.
-            quantity_entry = None
-            for entry in reversed(numerics):
-                if entry[0] >= rate_pos:
-                    continue
-                if not entry[3]:  # integer-looking
-                    quantity_entry = entry
-                    break
+
+            # ---- pick quantity if not already chosen by the Qty*Rate=Amount match above
             if quantity_entry is None:
-                # No integer to the left; fall back to any numeric to the left.
+                # Nearest integer to the LEFT of the rate.
                 for entry in reversed(numerics):
-                    if entry[0] < rate_pos:
+                    if entry[0] >= rate_pos:
+                        continue
+                    if not entry[3]:  # integer-looking
                         quantity_entry = entry
                         break
+                if quantity_entry is None:
+                    # No integer to the left; fall back to any numeric to the left.
+                    for entry in reversed(numerics):
+                        if entry[0] < rate_pos:
+                            quantity_entry = entry
+                            break
 
             if quantity_entry is None:
                 skipped_reasons.append(f"row {row_idx}: no quantity column to the left of rate")

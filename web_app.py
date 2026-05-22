@@ -8,9 +8,8 @@ Run with:
 Then open the shown URL from a phone on the same Wi-Fi network.
 """
 
-from contextlib import redirect_stderr, redirect_stdout
-from io import StringIO
 import os
+import sys
 import traceback
 import tempfile
 from pathlib import Path
@@ -23,14 +22,24 @@ from werkzeug.utils import secure_filename
 from trading_data_analyzer import TradingDataExtractor
 
 
+# Force unbuffered stdout/stderr so HF Spaces "Logs" tab streams step messages live
+# even if the container's PYTHONUNBUFFERED env var is not set.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, OSError):
+    pass
+
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif"}
 PDF_EXTENSIONS = {".pdf"}
 ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | PDF_EXTENSIONS
 MAX_FILES_PER_REQUEST = 7
 MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "12"))
-# Target DPI for PDF -> image rendering. ~200 dpi is enough for OCR and far cheaper than
-# the previous hard-coded zoom=2 on already-large pages.
-PDF_RENDER_DPI = int(os.environ.get("PDF_RENDER_DPI", "200"))
+# Target DPI for PDF -> image rendering. 150 dpi keeps trading UI text sharp while roughly
+# halving Tesseract time vs 200 dpi -- important on the free Hugging Face Spaces CPU. Override
+# with the PDF_RENDER_DPI env var if you need finer detail on a beefier host.
+PDF_RENDER_DPI = int(os.environ.get("PDF_RENDER_DPI", "150"))
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
@@ -654,16 +663,25 @@ PAGE = """
             continue;
           }
 
-          if (payload.results && payload.results.documents.length) {
-            const document = payload.results.documents[0];
-            buyTotal += Number(document.buy_total || 0);
-            sellTotal += Number(document.sell_total || 0);
-            renderDocument(document);
+          const docs = (payload.results && payload.results.documents) || [];
+          if (docs.length) {
+            // A single uploaded PDF can yield multiple "documents" (one per page).
+            // Render every page and sum their totals so multi-page PDFs are not truncated.
+            docs.forEach((doc) => {
+              buyTotal += Number(doc.buy_total || 0);
+              sellTotal += Number(doc.sell_total || 0);
+              renderDocument(doc);
+            });
             buyTotalEl.textContent = formatNumber(buyTotal);
             sellTotalEl.textContent = formatNumber(sellTotal);
             netTotalEl.textContent = formatNumber(buyTotal - sellTotal);
-          } else {
-            renderDiagnostic(file.name, payload.diagnostics || []);
+          }
+          if (payload.diagnostics && payload.diagnostics.length) {
+            // Also surface any per-page diagnostics (e.g. pages where OCR found no trades).
+            renderDiagnostic(file.name, payload.diagnostics);
+          }
+          if (!docs.length && !(payload.diagnostics && payload.diagnostics.length)) {
+            renderDiagnostic(file.name, [{ message: "No rows extracted.", text: "" }]);
           }
         }
         progress.textContent = "Done";
@@ -858,9 +876,11 @@ def process_image_api():
             else:
                 image_paths = [uploaded_path]
 
-            output_capture = StringIO()
-            with redirect_stdout(output_capture), redirect_stderr(output_capture):
-                extractor, diagnostics = process_uploaded_images(image_paths)
+            # NOTE: do NOT redirect stdout/stderr here. The per-step prints from
+            # StepLog must reach the HF Spaces "Logs" tab (and gunicorn's stdout
+            # in general). Structured step records are also returned in the JSON
+            # response under each document's `steps` field, so the UI is covered.
+            extractor, diagnostics = process_uploaded_images(image_paths)
 
             # Prepend PDF rendering steps onto the first document's step log so the UI shows
             # the full pipeline for that file.
@@ -871,16 +891,6 @@ def process_image_api():
                     extractor.steps_by_doc[doc_name] = pdf_steps + extractor.steps_by_doc[doc_name]
 
             if not extractor.trading_data:
-                captured_output = output_capture.getvalue().strip()
-                if captured_output:
-                    diagnostics.append(
-                        {
-                            "name": "OCR processing log",
-                            "message": "Internal messages from image processing.",
-                            "text": captured_output[-3000:],
-                            "steps": [],
-                        }
-                    )
                 return jsonify({"error": "No trading data could be extracted.", "diagnostics": diagnostics}), 422
 
             return jsonify({"results": build_results(extractor), "diagnostics": diagnostics})
@@ -965,12 +975,9 @@ def index():
                 else:
                     image_paths.append(uploaded_path)
 
-            output_capture = StringIO()
-            extractor = None
-            diagnostics = []
-
-            with redirect_stdout(output_capture), redirect_stderr(output_capture):
-                extractor, diagnostics = process_uploaded_images(image_paths)
+            # See API endpoint above: keep stdout unredirected so HF Logs sees
+            # the per-step prints. UI gets the same data via diag["steps"].
+            extractor, diagnostics = process_uploaded_images(image_paths)
 
             # Prepend any PDF render steps onto matching documents
             if pdf_steps_by_file:
@@ -984,17 +991,6 @@ def index():
                         extractor.steps_by_doc[doc_name] = extra + extractor.steps_by_doc[doc_name]
 
             if not extractor.trading_data:
-                captured_output = output_capture.getvalue().strip()
-                if captured_output:
-                    diagnostics.append(
-                        {
-                            "name": "OCR processing log",
-                            "message": "Internal messages from image processing.",
-                            "text": captured_output[-3000:],
-                            "steps": [],
-                        }
-                    )
-
                 return render_template_string(
                     PAGE,
                     error="No trading data could be extracted. Try a clearer image.",
