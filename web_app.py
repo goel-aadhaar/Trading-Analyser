@@ -15,6 +15,7 @@ import traceback
 import tempfile
 from pathlib import Path
 
+import fitz
 from flask import Flask, jsonify, render_template_string, request
 import pytesseract
 from werkzeug.utils import secure_filename
@@ -22,8 +23,11 @@ from werkzeug.utils import secure_filename
 from trading_data_analyzer import TradingDataExtractor
 
 
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif"}
+PDF_EXTENSIONS = {".pdf"}
+ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | PDF_EXTENSIONS
 MAX_FILES_PER_REQUEST = 7
+MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "12"))
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
@@ -100,13 +104,18 @@ PAGE = """
       font-weight: 700;
     }
 
-    input[type="file"] {
+    input[type="file"],
+    input[type="password"] {
       width: 100%;
       padding: 14px;
       border: 1px dashed #9aa7b5;
       border-radius: 8px;
       background: #fbfcfd;
       color: var(--ink);
+    }
+
+    input[type="password"] {
+      border-style: solid;
     }
 
     button {
@@ -304,10 +313,12 @@ PAGE = """
     {% endif %}
 
     <form id="upload-form" method="post" enctype="multipart/form-data">
-      <label for="images">Trading images</label>
-      <input id="images" name="images" type="file" accept=".jpg,.jpeg,.png,.tif,.tiff,image/*" multiple required>
+      <label for="images">Trading files</label>
+      <input id="images" name="images" type="file" accept=".jpg,.jpeg,.png,.tif,.tiff,.pdf,image/*,application/pdf" multiple required>
+      <label for="pdf-password" style="margin-top: 14px;">PDF password</label>
+      <input id="pdf-password" name="pdf_password" type="password" autocomplete="off" placeholder="Only needed for locked PDFs">
       <button type="submit">Show Trading Data</button>
-      <p class="note">Supported: JPG, PNG, JPEG, TIFF. You can select more than one image.</p>
+      <p class="note">Supported: PDF, JPG, PNG, JPEG, TIFF. You can select more than one file.</p>
       <p id="progress" class="progress hidden"></p>
     </form>
 
@@ -403,6 +414,7 @@ PAGE = """
     const maxFiles = {{ max_files }};
     const form = document.getElementById("upload-form");
     const fileInput = document.getElementById("images");
+    const passwordInput = document.getElementById("pdf-password");
     const progress = document.getElementById("progress");
     const resultsSection = document.getElementById("client-results");
     const documentsEl = document.getElementById("client-documents");
@@ -508,6 +520,7 @@ PAGE = """
 
           const formData = new FormData();
           formData.append("image", file);
+          formData.append("pdf_password", passwordInput.value || "");
 
           const response = await fetch("/api/process-image", {
             method: "POST",
@@ -548,6 +561,38 @@ PAGE = """
 
 def is_allowed_file(filename):
     return Path(filename).suffix.lower() in ALLOWED_EXTENSIONS
+
+
+def is_pdf_file(filename):
+    return Path(filename).suffix.lower() in PDF_EXTENSIONS
+
+
+def render_pdf_to_images(pdf_path, output_dir, password=""):
+    image_paths = []
+    document = fitz.open(pdf_path)
+
+    try:
+        if document.needs_pass:
+            if not password:
+                raise ValueError("This PDF is password protected. Enter the PDF password.")
+            if not document.authenticate(password):
+                raise ValueError("Incorrect PDF password.")
+
+        if document.page_count > MAX_PDF_PAGES:
+            raise ValueError(f"PDF has {document.page_count} pages. Upload {MAX_PDF_PAGES} pages or fewer at a time.")
+
+        zoom = 2.0
+        matrix = fitz.Matrix(zoom, zoom)
+        for page_index in range(document.page_count):
+            page = document.load_page(page_index)
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            image_path = output_dir / f"{pdf_path.stem}_page_{page_index + 1}.png"
+            pixmap.save(image_path)
+            image_paths.append(image_path)
+    finally:
+        document.close()
+
+    return image_paths
 
 
 def build_results(extractor):
@@ -629,8 +674,10 @@ def health():
 @app.route("/api/process-image", methods=["POST"])
 def process_image_api():
     uploaded_file = request.files.get("image")
+    pdf_password = request.form.get("pdf_password", "")
+
     if not uploaded_file or not uploaded_file.filename:
-        return jsonify({"error": "Please choose an image.", "diagnostics": []}), 400
+        return jsonify({"error": "Please choose a file.", "diagnostics": []}), 400
 
     if not is_allowed_file(uploaded_file.filename):
         return jsonify(
@@ -639,7 +686,7 @@ def process_image_api():
                 "diagnostics": [
                     {
                         "name": uploaded_file.filename,
-                        "message": "Supported formats are JPG, PNG, JPEG, and TIFF.",
+                        "message": "Supported formats are PDF, JPG, PNG, JPEG, and TIFF.",
                         "text": "",
                     }
                 ],
@@ -650,12 +697,31 @@ def process_image_api():
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             original_name = secure_filename(uploaded_file.filename) or "image.png"
-            image_path = temp_path / original_name
-            uploaded_file.save(image_path)
+            uploaded_path = temp_path / original_name
+            uploaded_file.save(uploaded_path)
+
+            if is_pdf_file(original_name):
+                try:
+                    image_paths = render_pdf_to_images(uploaded_path, temp_path, pdf_password)
+                except ValueError as exc:
+                    return jsonify(
+                        {
+                            "error": str(exc),
+                            "diagnostics": [
+                                {
+                                    "name": original_name,
+                                    "message": str(exc),
+                                    "text": "",
+                                }
+                            ],
+                        }
+                    ), 422
+            else:
+                image_paths = [uploaded_path]
 
             output_capture = StringIO()
             with redirect_stdout(output_capture), redirect_stderr(output_capture):
-                extractor, diagnostics = process_uploaded_images([image_path])
+                extractor, diagnostics = process_uploaded_images(image_paths)
 
             if not extractor.trading_data:
                 captured_output = output_capture.getvalue().strip()
@@ -712,13 +778,33 @@ def index():
             temp_path = Path(temp_dir)
             image_paths = []
 
+            pdf_password = request.form.get("pdf_password", "")
+
             for index, uploaded_file in enumerate(files, start=1):
                 original_name = secure_filename(uploaded_file.filename)
                 if not original_name:
                     original_name = f"image_{index}.png"
-                image_path = temp_path / f"{index}_{original_name}"
-                uploaded_file.save(image_path)
-                image_paths.append(image_path)
+                uploaded_path = temp_path / f"{index}_{original_name}"
+                uploaded_file.save(uploaded_path)
+
+                if is_pdf_file(original_name):
+                    try:
+                        image_paths.extend(render_pdf_to_images(uploaded_path, temp_path, pdf_password))
+                    except ValueError as exc:
+                        return render_template_string(
+                            PAGE,
+                            error=str(exc),
+                            diagnostics=[
+                                {
+                                    "name": original_name,
+                                    "message": str(exc),
+                                    "text": "",
+                                }
+                            ],
+                            max_files=MAX_FILES_PER_REQUEST,
+                        )
+                else:
+                    image_paths.append(uploaded_path)
 
             output_capture = StringIO()
             extractor = None
