@@ -22,9 +22,10 @@ from trading_data_analyzer import TradingDataExtractor
 
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif"}
+MAX_FILES_PER_REQUEST = 4
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 
 PAGE = """
@@ -379,6 +380,12 @@ def index():
 
         if not files:
             return render_template_string(PAGE, error="Please choose at least one image.")
+
+        if len(files) > MAX_FILES_PER_REQUEST:
+            return render_template_string(
+                PAGE,
+                error=f"Please upload {MAX_FILES_PER_REQUEST} images or fewer at a time.",
+            )
 
         invalid_files = [file.filename for file in files if not is_allowed_file(file.filename)]
         if invalid_files:

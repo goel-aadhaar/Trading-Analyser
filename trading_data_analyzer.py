@@ -25,6 +25,9 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
+MAX_OCR_IMAGE_DIMENSION = int(os.environ.get("MAX_OCR_IMAGE_DIMENSION", "1800"))
+OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "25"))
+
 # Configure Tesseract path for Windows
 if sys.platform == 'win32':
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
@@ -44,6 +47,13 @@ class TradingDataExtractor:
                 print(f"    (Verify file path with spaces/parentheses is valid)")
                 print(f"    (Verify file format is supported: jpg, png, jpeg, tiff)")
                 raise ValueError(f"Could not read image: {image_path}")
+
+            height, width = img.shape[:2]
+            largest_dimension = max(width, height)
+            if largest_dimension > MAX_OCR_IMAGE_DIMENSION:
+                scale = MAX_OCR_IMAGE_DIMENSION / largest_dimension
+                new_size = (int(width * scale), int(height * scale))
+                img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
             
             # Convert to grayscale - works best with Tesseract config
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -69,7 +79,11 @@ class TradingDataExtractor:
             custom_config = r'--oem 3 --psm 6'
             
             # Extract text using Tesseract
-            text = pytesseract.image_to_string(pil_img, config=custom_config)
+            text = pytesseract.image_to_string(
+                pil_img,
+                config=custom_config,
+                timeout=OCR_TIMEOUT_SECONDS,
+            )
             return text
         except FileNotFoundError as e:
             print(f"Error: Could not find Tesseract. Please install it:")
