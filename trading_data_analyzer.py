@@ -26,7 +26,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 MAX_OCR_IMAGE_DIMENSION = int(os.environ.get("MAX_OCR_IMAGE_DIMENSION", "3200"))
-OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "60"))
+OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "180"))
 
 # Configure Tesseract path for Windows
 if sys.platform == 'win32':
