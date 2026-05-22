@@ -1,0 +1,67 @@
+# Hugging Face Spaces Deployment
+
+Hugging Face Spaces is a good free host for this OCR app because Docker Spaces can run Tesseract and OpenCV inside the container.
+
+## 1. Create A Space
+
+1. Go to https://huggingface.co/spaces
+2. Click `Create new Space`.
+3. Choose a Space name, for example `trading-analyser`.
+4. Select `Docker` as the SDK.
+5. Choose `Public`.
+6. Choose the free CPU hardware.
+7. Create the Space.
+
+## 2. Add This App To The Space
+
+Open the Space, then use the `Files` tab to upload these files from this folder:
+
+```text
+Dockerfile
+requirements.txt
+web_app.py
+trading_data_analyzer.py
+README.md
+```
+
+You can also push by Git if you prefer:
+
+```bash
+git clone https://huggingface.co/spaces/YOUR_USERNAME/YOUR_SPACE_NAME
+cd YOUR_SPACE_NAME
+copy C:\Users\laptop\Desktop\scr\Dockerfile .
+copy C:\Users\laptop\Desktop\scr\requirements.txt .
+copy C:\Users\laptop\Desktop\scr\web_app.py .
+copy C:\Users\laptop\Desktop\scr\trading_data_analyzer.py .
+copy C:\Users\laptop\Desktop\scr\README.md .
+git add .
+git commit -m "Deploy trading analyzer"
+git push
+```
+
+Replace `YOUR_USERNAME` and `YOUR_SPACE_NAME`.
+
+## 3. Space Configuration
+
+If the Space asks for config, use:
+
+```yaml
+---
+title: Trading Data Analyzer
+sdk: docker
+app_port: 7860
+---
+```
+
+The Dockerfile already exposes port `7860`.
+
+## 4. Wait For Build
+
+Hugging Face will build the Docker image. When it finishes, open the Space URL and upload your images.
+
+## Notes
+
+- Free CPU Spaces can pause after inactivity.
+- First load after pause can be slow.
+- OCR still takes time, but free Hugging Face CPU hardware is usually better suited to this than Render free.
+- If you deploy from the GitHub repo instead, make sure Hugging Face uses the latest `Dockerfile`.

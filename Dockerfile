@@ -17,6 +17,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 5000
+EXPOSE 7860
 
-CMD ["sh", "-c", "gunicorn --timeout 240 --bind 0.0.0.0:${PORT:-5000} web_app:app"]
+CMD ["sh", "-c", "gunicorn --timeout 240 --bind 0.0.0.0:${PORT:-7860} web_app:app"]
