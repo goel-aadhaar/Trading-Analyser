@@ -1,3 +1,9 @@
+---
+title: Trading Data Analyzer
+sdk: docker
+app_port: 7860
+---
+
 # Trading Data Analyzer - OCR Version
 
 A Python tool that extracts trading data from images using OCR (Optical Character Recognition), performs calculations, and generates professional Excel reports.
