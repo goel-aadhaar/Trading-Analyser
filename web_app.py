@@ -140,6 +140,33 @@ PAGE = """
       font-weight: 700;
     }
 
+    .debug {
+      margin-top: 14px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+    }
+
+    .debug h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+
+    .debug pre {
+      margin: 8px 0 0;
+      max-height: 220px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 13px;
+      line-height: 1.35;
+      color: var(--ink);
+      background: #f3f5f7;
+      border-radius: 6px;
+      padding: 10px;
+    }
+
     .steps {
       margin-top: 18px;
       padding: 0;
@@ -253,6 +280,18 @@ PAGE = """
       <div class="error">{{ error }}</div>
     {% endif %}
 
+    {% if diagnostics %}
+      {% for item in diagnostics %}
+        <section class="debug">
+          <h3>{{ item.name }}</h3>
+          <p>{{ item.message }}</p>
+          {% if item.text %}
+            <pre>{{ item.text }}</pre>
+          {% endif %}
+        </section>
+      {% endfor %}
+    {% endif %}
+
     <form method="post" enctype="multipart/form-data">
       <label for="images">Trading images</label>
       <input id="images" name="images" type="file" accept=".jpg,.jpeg,.png,.tif,.tiff,image/*" multiple required>
@@ -364,6 +403,41 @@ def build_results(extractor):
     }
 
 
+def process_uploaded_images(image_paths):
+    extractor = TradingDataExtractor()
+    diagnostics = []
+
+    for image_path in image_paths:
+        doc_name = Path(image_path).stem
+        text = extractor.extract_text_from_image(image_path)
+
+        if not text:
+            diagnostics.append(
+                {
+                    "name": doc_name,
+                    "message": "OCR could not read any text from this image.",
+                    "text": "",
+                }
+            )
+            continue
+
+        trades = extractor.parse_trading_data(text)
+        if not trades:
+            diagnostics.append(
+                {
+                    "name": doc_name,
+                    "message": "OCR read text, but no BUY/SELL rows matched the parser.",
+                    "text": text.strip()[:3000],
+                }
+            )
+            continue
+
+        extractor.documents[doc_name] = trades
+        extractor.trading_data.extend(trades)
+
+    return extractor, diagnostics
+
+
 @app.route("/health")
 def health():
     return {"status": "ok"}
@@ -406,21 +480,21 @@ def index():
                 uploaded_file.save(image_path)
                 image_paths.append(image_path)
 
-            extractor = TradingDataExtractor()
             output_capture = StringIO()
 
             with redirect_stdout(output_capture), redirect_stderr(output_capture):
-                processed = extractor.process_images(image_paths)
+                extractor, diagnostics = process_uploaded_images(image_paths)
 
-            if not processed:
+            if not extractor.trading_data:
                 return render_template_string(
                     PAGE,
                     error="No trading data could be extracted. Try a clearer image.",
+                    diagnostics=diagnostics,
                 )
 
             results = build_results(extractor)
 
-        return render_template_string(PAGE, results=results)
+        return render_template_string(PAGE, results=results, diagnostics=diagnostics)
     except Exception:
         error = traceback.format_exc()
         print(error, flush=True)
