@@ -15,7 +15,7 @@ import traceback
 import tempfile
 from pathlib import Path
 
-from flask import Flask, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request
 from werkzeug.utils import secure_filename
 
 from trading_data_analyzer import TradingDataExtractor
@@ -262,6 +262,16 @@ PAGE = """
       font-size: 18px;
     }
 
+    .progress {
+      margin-top: 14px;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .hidden {
+      display: none;
+    }
+
     @media (max-width: 560px) {
       .summary-grid {
         grid-template-columns: 1fr;
@@ -292,12 +302,32 @@ PAGE = """
       {% endfor %}
     {% endif %}
 
-    <form method="post" enctype="multipart/form-data">
+    <form id="upload-form" method="post" enctype="multipart/form-data">
       <label for="images">Trading images</label>
       <input id="images" name="images" type="file" accept=".jpg,.jpeg,.png,.tif,.tiff,image/*" multiple required>
       <button type="submit">Show Trading Data</button>
       <p class="note">Supported: JPG, PNG, JPEG, TIFF. You can select more than one image.</p>
+      <p id="progress" class="progress hidden"></p>
     </form>
+
+    <section id="client-results" class="results hidden">
+      <h2>Summary</h2>
+      <div class="summary-grid">
+        <div class="metric">
+          <span>BUY Total</span>
+          <strong id="client-buy-total" class="buy">0.0000</strong>
+        </div>
+        <div class="metric">
+          <span>SELL Total</span>
+          <strong id="client-sell-total" class="sell">0.0000</strong>
+        </div>
+        <div class="metric">
+          <span>NET</span>
+          <strong id="client-net-total">0.0000</strong>
+        </div>
+      </div>
+      <div id="client-documents"></div>
+    </section>
 
     {% if results %}
       <section class="results">
@@ -366,6 +396,146 @@ PAGE = """
       <li>Choose images from your phone to view the extracted totals and rows here.</li>
     </ul>
   </main>
+  <script>
+    const maxFiles = {{ max_files }};
+    const form = document.getElementById("upload-form");
+    const fileInput = document.getElementById("images");
+    const progress = document.getElementById("progress");
+    const resultsSection = document.getElementById("client-results");
+    const documentsEl = document.getElementById("client-documents");
+    const buyTotalEl = document.getElementById("client-buy-total");
+    const sellTotalEl = document.getElementById("client-sell-total");
+    const netTotalEl = document.getElementById("client-net-total");
+
+    function formatNumber(value) {
+      return Number(value || 0).toFixed(4);
+    }
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function renderDocument(doc) {
+      const rows = doc.trades.map((trade) => `
+        <tr>
+          <td class="${String(trade.direction).toLowerCase()}">${escapeHtml(trade.direction)}</td>
+          <td class="number">${escapeHtml(trade.quantity)}</td>
+          <td class="number">${formatNumber(trade.rate)}</td>
+          <td class="number">${formatNumber(trade.calculated)}</td>
+        </tr>
+      `).join("");
+
+      const wrapper = document.createElement("div");
+      wrapper.innerHTML = `
+        <h3 class="doc-title">${escapeHtml(doc.name)}</h3>
+        <div class="summary-grid">
+          <div class="metric">
+            <span>BUY</span>
+            <strong class="buy">${formatNumber(doc.buy_total)}</strong>
+          </div>
+          <div class="metric">
+            <span>SELL</span>
+            <strong class="sell">${formatNumber(doc.sell_total)}</strong>
+          </div>
+          <div class="metric">
+            <span>Trades</span>
+            <strong>${escapeHtml(doc.count)}</strong>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Sell/Buy</th>
+                <th class="number">Quantity</th>
+                <th class="number">Market Rate</th>
+                <th class="number">Calculated Value</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      `;
+      documentsEl.appendChild(wrapper);
+    }
+
+    function renderDiagnostic(fileName, diagnostics) {
+      const wrapper = document.createElement("section");
+      wrapper.className = "debug";
+      const details = diagnostics.map((item) => `
+        <p>${escapeHtml(item.message)}</p>
+        ${item.text ? `<pre>${escapeHtml(item.text)}</pre>` : ""}
+      `).join("");
+      wrapper.innerHTML = `<h3>${escapeHtml(fileName)}</h3>${details || "<p>No rows found.</p>"}`;
+      documentsEl.appendChild(wrapper);
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const files = Array.from(fileInput.files || []);
+      if (!files.length) {
+        return;
+      }
+
+      if (files.length > maxFiles) {
+        progress.textContent = `Please upload ${maxFiles} images or fewer at a time.`;
+        progress.classList.remove("hidden");
+        return;
+      }
+
+      let buyTotal = 0;
+      let sellTotal = 0;
+      documentsEl.innerHTML = "";
+      resultsSection.classList.remove("hidden");
+      progress.classList.remove("hidden");
+      form.querySelector("button").disabled = true;
+
+      try {
+        for (let index = 0; index < files.length; index += 1) {
+          const file = files[index];
+          progress.textContent = `Processing ${index + 1} of ${files.length}: ${file.name}`;
+
+          const formData = new FormData();
+          formData.append("image", file);
+
+          const response = await fetch("/api/process-image", {
+            method: "POST",
+            body: formData,
+          });
+          const payload = await response.json();
+
+          if (!response.ok || payload.error) {
+            renderDiagnostic(file.name, payload.diagnostics || [{ message: payload.error || "Processing failed.", text: "" }]);
+            continue;
+          }
+
+          if (payload.results && payload.results.documents.length) {
+            const document = payload.results.documents[0];
+            buyTotal += Number(document.buy_total || 0);
+            sellTotal += Number(document.sell_total || 0);
+            renderDocument(document);
+            buyTotalEl.textContent = formatNumber(buyTotal);
+            sellTotalEl.textContent = formatNumber(sellTotal);
+            netTotalEl.textContent = formatNumber(buyTotal - sellTotal);
+          } else {
+            renderDiagnostic(file.name, payload.diagnostics || []);
+          }
+        }
+        progress.textContent = "Done";
+      } catch (error) {
+        progress.textContent = "Processing failed. Try fewer or smaller images.";
+        renderDiagnostic("Request error", [{ message: String(error), text: "" }]);
+      } finally {
+        form.querySelector("button").disabled = false;
+      }
+    });
+  </script>
 </body>
 </html>
 """
@@ -443,22 +613,78 @@ def health():
     return {"status": "ok"}
 
 
+@app.route("/api/process-image", methods=["POST"])
+def process_image_api():
+    uploaded_file = request.files.get("image")
+    if not uploaded_file or not uploaded_file.filename:
+        return jsonify({"error": "Please choose an image.", "diagnostics": []}), 400
+
+    if not is_allowed_file(uploaded_file.filename):
+        return jsonify(
+            {
+                "error": "Unsupported file type.",
+                "diagnostics": [
+                    {
+                        "name": uploaded_file.filename,
+                        "message": "Supported formats are JPG, PNG, JPEG, and TIFF.",
+                        "text": "",
+                    }
+                ],
+            }
+        ), 400
+
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            original_name = secure_filename(uploaded_file.filename) or "image.png"
+            image_path = temp_path / original_name
+            uploaded_file.save(image_path)
+
+            output_capture = StringIO()
+            with redirect_stdout(output_capture), redirect_stderr(output_capture):
+                extractor, diagnostics = process_uploaded_images([image_path])
+
+            if not extractor.trading_data:
+                captured_output = output_capture.getvalue().strip()
+                if captured_output:
+                    diagnostics.append(
+                        {
+                            "name": "OCR processing log",
+                            "message": "Internal messages from image processing.",
+                            "text": captured_output[-3000:],
+                        }
+                    )
+                return jsonify({"error": "No trading data could be extracted.", "diagnostics": diagnostics}), 422
+
+            return jsonify({"results": build_results(extractor), "diagnostics": diagnostics})
+    except Exception:
+        error = traceback.format_exc()
+        print(error, flush=True)
+        return jsonify(
+            {
+                "error": "Image processing failed.",
+                "diagnostics": [{"name": uploaded_file.filename, "message": error, "text": ""}],
+            }
+        ), 500
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     try:
         if request.method == "GET":
-            return render_template_string(PAGE)
+            return render_template_string(PAGE, max_files=MAX_FILES_PER_REQUEST)
 
         files = request.files.getlist("images")
         files = [file for file in files if file and file.filename]
 
         if not files:
-            return render_template_string(PAGE, error="Please choose at least one image.")
+            return render_template_string(PAGE, error="Please choose at least one image.", max_files=MAX_FILES_PER_REQUEST)
 
         if len(files) > MAX_FILES_PER_REQUEST:
             return render_template_string(
                 PAGE,
                 error=f"Please upload {MAX_FILES_PER_REQUEST} images or fewer at a time.",
+                max_files=MAX_FILES_PER_REQUEST,
             )
 
         invalid_files = [file.filename for file in files if not is_allowed_file(file.filename)]
@@ -466,6 +692,7 @@ def index():
             return render_template_string(
                 PAGE,
                 error=f"Unsupported file type: {', '.join(invalid_files)}",
+                max_files=MAX_FILES_PER_REQUEST,
             )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -502,15 +729,16 @@ def index():
                     PAGE,
                     error="No trading data could be extracted. Try a clearer image.",
                     diagnostics=diagnostics,
+                    max_files=MAX_FILES_PER_REQUEST,
                 )
 
             results = build_results(extractor)
 
-        return render_template_string(PAGE, results=results, diagnostics=diagnostics)
+        return render_template_string(PAGE, results=results, diagnostics=diagnostics, max_files=MAX_FILES_PER_REQUEST)
     except Exception:
         error = traceback.format_exc()
         print(error, flush=True)
-        return render_template_string(PAGE, error=error), 500
+        return render_template_string(PAGE, error=error, max_files=MAX_FILES_PER_REQUEST), 500
 
 
 if __name__ == "__main__":
