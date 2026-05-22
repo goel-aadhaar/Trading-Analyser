@@ -15,6 +15,7 @@ Also requires Tesseract OCR to be installed:
 import os
 import sys
 import re
+import time
 from pathlib import Path
 from PIL import Image
 import cv2
@@ -27,161 +28,466 @@ warnings.filterwarnings('ignore')
 
 MAX_OCR_IMAGE_DIMENSION = int(os.environ.get("MAX_OCR_IMAGE_DIMENSION", "3200"))
 OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "180"))
+# --psm 6 = uniform block of text (default in old code).
+# --psm 4 = single column of text of variable sizes (works well for trade tables).
+TESSERACT_CONFIG = os.environ.get("TESSERACT_CONFIG", r"--oem 3 --psm 6")
+TESSERACT_CONFIG_FALLBACK = os.environ.get("TESSERACT_CONFIG_FALLBACK", r"--oem 3 --psm 4")
+MIN_WORD_CONFIDENCE = int(os.environ.get("MIN_WORD_CONFIDENCE", "30"))
 
 # Configure Tesseract path for Windows
 if sys.platform == 'win32':
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 
+class StepLog:
+    """Collects per-step records for a single image and optionally echoes them to stdout.
+
+    Each entry is a dict with keys: step, status (ok|warn|error|info), message, detail, elapsed_ms.
+    """
+
+    def __init__(self, echo=True, prefix=""):
+        self.entries = []
+        self.echo = echo
+        self.prefix = prefix
+        self._start = time.perf_counter()
+
+    def add(self, step, status, message, detail=""):
+        elapsed_ms = int((time.perf_counter() - self._start) * 1000)
+        entry = {
+            "step": step,
+            "status": status,
+            "message": message,
+            "detail": detail,
+            "elapsed_ms": elapsed_ms,
+        }
+        self.entries.append(entry)
+        if self.echo:
+            icon = {"ok": "[ok]", "warn": "[!]", "error": "[x]", "info": "[.]"}.get(status, "[.]")
+            try:
+                print(f"  {icon} [{step}] {self.prefix}{message} ({elapsed_ms} ms)", flush=True)
+                if detail:
+                    snippet = detail if len(detail) < 400 else detail[:400] + "..."
+                    for line in snippet.splitlines():
+                        print(f"      {line}", flush=True)
+            except UnicodeEncodeError:
+                # Fall back to ASCII-only output on legacy terminals.
+                safe_msg = message.encode("ascii", "replace").decode("ascii")
+                print(f"  {icon} [{step}] {self.prefix}{safe_msg} ({elapsed_ms} ms)", flush=True)
+        return entry
+
+    def reset_timer(self):
+        self._start = time.perf_counter()
+
+
+def _strip_number_token(token):
+    """Strip currency, parentheses, percent etc., return cleaned numeric string or None."""
+    if token is None:
+        return None
+    t = token.strip().replace(",", "")
+    t = t.strip("()[]{}$₹€£%")
+    if t.endswith("."):
+        t = t[:-1]
+    if t.startswith("."):
+        t = "0" + t
+    if not t:
+        return None
+    if not re.fullmatch(r"-?\d+(\.\d+)?", t):
+        return None
+    return t
+
+
+def _looks_like_time_or_date(token):
+    return bool(re.search(r"\d:\d", token)) or bool(re.search(r"\d[/-]\d", token))
+
+
 class TradingDataExtractor:
     def __init__(self):
         self.trading_data = []
         self.documents = {}
+        # per-document steps log: doc_name -> list[dict]
+        self.steps_by_doc = {}
         
-    def preprocess_image(self, image_path):
-        """Preprocess image for better OCR accuracy"""
+    def preprocess_image(self, image_path, log=None):
+        """Load image, downscale if huge, grayscale + Otsu binarize for OCR."""
         try:
             img = cv2.imread(str(image_path))
             if img is None:
-                print(f"  ✗ Could not read image: {image_path}")
-                print(f"    (Verify file path with spaces/parentheses is valid)")
-                print(f"    (Verify file format is supported: jpg, png, jpeg, tiff)")
-                raise ValueError(f"Could not read image: {image_path}")
+                msg = f"Could not read image: {image_path}"
+                if log: log.add("preprocess", "error", msg,
+                                "Verify path (spaces/parentheses) and that the format is JPG/PNG/JPEG/TIFF.")
+                else:
+                    print(f"  ✗ {msg}")
+                raise ValueError(msg)
 
             height, width = img.shape[:2]
+            orig_size = f"{width}x{height}"
             largest_dimension = max(width, height)
             if largest_dimension > MAX_OCR_IMAGE_DIMENSION:
                 scale = MAX_OCR_IMAGE_DIMENSION / largest_dimension
                 new_size = (int(width * scale), int(height * scale))
                 img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
-            
-            # Convert to grayscale - works best with Tesseract config
+                if log: log.add("preprocess", "info",
+                                f"Resized {orig_size} -> {new_size[0]}x{new_size[1]} (cap={MAX_OCR_IMAGE_DIMENSION})")
+            else:
+                if log: log.add("preprocess", "info", f"Loaded image {orig_size}")
+
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            
-            return gray
+            # Otsu binarization tends to be both faster for Tesseract and more accurate
+            # for clean screenshots; if the image is photo-like it might overdo it, so we
+            # keep the grayscale around in case binarization fails.
+            try:
+                _, binarized = cv2.threshold(gray, 0, 255,
+                                             cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                if log: log.add("preprocess", "ok", "Grayscale + Otsu binarization applied")
+                return binarized
+            except cv2.error as exc:
+                if log: log.add("preprocess", "warn", f"Binarization failed, using grayscale: {exc}")
+                return gray
         except Exception as e:
-            print(f"Error preprocessing image {image_path}: {e}")
+            if log: log.add("preprocess", "error", f"Preprocess failed: {e}")
+            else: print(f"Error preprocessing image {image_path}: {e}")
             return None
-    
-    def extract_text_from_image(self, image_path):
-        """Extract text from image using OCR"""
+
+    def _run_tesseract_data(self, pil_img, config, log=None):
+        """Run image_to_data and return list of word dicts with bboxes + confidence."""
+        data = pytesseract.image_to_data(
+            pil_img,
+            config=config,
+            timeout=OCR_TIMEOUT_SECONDS,
+            output_type=pytesseract.Output.DICT,
+        )
+        words = []
+        n = len(data.get("text", []))
+        for i in range(n):
+            text = (data["text"][i] or "").strip()
+            if not text:
+                continue
+            try:
+                conf = int(float(data["conf"][i]))
+            except (TypeError, ValueError):
+                conf = -1
+            words.append({
+                "text": text,
+                "conf": conf,
+                "block": data["block_num"][i],
+                "par": data["par_num"][i],
+                "line": data["line_num"][i],
+                "word": data["word_num"][i],
+                "left": data["left"][i],
+                "top": data["top"][i],
+                "width": data["width"][i],
+                "height": data["height"][i],
+            })
+        if log:
+            avg_conf = (sum(w["conf"] for w in words if w["conf"] >= 0) / max(1, sum(1 for w in words if w["conf"] >= 0))) if words else 0
+            log.add("ocr", "ok",
+                    f"OCR returned {len(words)} words (avg conf {avg_conf:.0f}, config '{config}')")
+        return words
+
+    def run_ocr(self, image_path, log=None):
+        """Step 2: run OCR -> returns (raw_text, words). Falls back to a 2nd PSM if first is empty."""
+        processed = self.preprocess_image(image_path, log=log)
+        if processed is None:
+            return None, []
+
+        pil_img = Image.fromarray(processed)
+
         try:
-            processed_img = self.preprocess_image(image_path)
-            if processed_img is None:
-                return None
-            
-            # Convert numpy array to PIL Image for pytesseract
-            pil_img = Image.fromarray(processed_img)
-            
-            # Use optimized Tesseract config for trading data
-            # --oem 3: Legacy + LSTM
-            # --psm 6: Block of text
-            custom_config = r'--oem 3 --psm 6'
-            
-            # Extract text using Tesseract
-            text = pytesseract.image_to_string(
-                pil_img,
-                config=custom_config,
-                timeout=OCR_TIMEOUT_SECONDS,
-            )
-            return text
-        except FileNotFoundError as e:
-            print(f"Error: Could not find Tesseract. Please install it:")
-            print(f"  Windows: https://github.com/UB-Mannheim/tesseract/wiki")
-            print(f"  macOS: brew install tesseract")
-            print(f"  Linux: sudo apt-get install tesseract-ocr")
-            return None
+            words = self._run_tesseract_data(pil_img, TESSERACT_CONFIG, log=log)
+            if not words and TESSERACT_CONFIG_FALLBACK != TESSERACT_CONFIG:
+                if log: log.add("ocr", "warn", "Primary OCR found 0 words, retrying with fallback PSM")
+                words = self._run_tesseract_data(pil_img, TESSERACT_CONFIG_FALLBACK, log=log)
+        except FileNotFoundError:
+            msg = ("Tesseract not found. Install it: "
+                   "Windows https://github.com/UB-Mannheim/tesseract/wiki, "
+                   "macOS `brew install tesseract`, Linux `apt-get install tesseract-ocr`.")
+            if log: log.add("ocr", "error", msg)
+            else: print(msg)
+            return None, []
         except Exception as e:
-            print(f"Error extracting text from {image_path}: {e}")
-            return None
-    
+            if log: log.add("ocr", "error", f"OCR failed: {e}")
+            else: print(f"Error extracting text from {image_path}: {e}")
+            return None, []
+
+        raw_text = self._reconstruct_text(words)
+        if log:
+            log.add("ocr", "info",
+                    f"Reconstructed text: {len(raw_text)} chars, {len(raw_text.splitlines())} lines",
+                    detail=raw_text[:600])
+        return raw_text, words
+
+    def _reconstruct_text(self, words):
+        """Group words back into lines using Tesseract's (block, par, line) grouping."""
+        if not words:
+            return ""
+        groups = {}
+        for w in words:
+            key = (w["block"], w["par"], w["line"])
+            groups.setdefault(key, []).append(w)
+        lines = []
+        for key in sorted(groups.keys()):
+            row = sorted(groups[key], key=lambda x: x["left"])
+            lines.append(" ".join(w["text"] for w in row))
+        return "\n".join(lines)
+
+    # Kept for backward compat with code that imports it.
+    def extract_text_from_image(self, image_path):
+        text, _ = self.run_ocr(image_path, log=None)
+        return text
+
+    # ------------------------------------------------------------------ tabular
+
+    def build_table_rows(self, words, log=None):
+        """Step 3: group OCR words into tabular rows using Tesseract's own line grouping
+        (block_num, par_num, line_num). Returns list of rows; each row is a list of word dicts
+        sorted left-to-right."""
+        if not words:
+            if log: log.add("table", "warn", "No OCR words to assemble into rows")
+            return []
+
+        # Discard low-confidence noise words but keep words even with conf == -1
+        # (Tesseract emits -1 for some merged tokens).
+        filtered = [w for w in words if w["conf"] < 0 or w["conf"] >= MIN_WORD_CONFIDENCE]
+        dropped = len(words) - len(filtered)
+
+        groups = {}
+        for w in filtered:
+            key = (w["block"], w["par"], w["line"])
+            groups.setdefault(key, []).append(w)
+
+        rows = []
+        for key in sorted(groups.keys()):
+            row = sorted(groups[key], key=lambda x: x["left"])
+            rows.append(row)
+
+        if log:
+            log.add("table", "ok",
+                    f"Built {len(rows)} rows from {len(filtered)} words"
+                    + (f" (dropped {dropped} low-conf)" if dropped else ""))
+        return rows
+
+    def parse_trades_from_rows(self, rows, log=None):
+        """Step 4 (preferred): find BUY/SELL rows in tabular output and extract qty + rate.
+
+        Positional heuristic (mirrors how a trade row is actually structured):
+          - Skip tokens that look like times (12:34) or dates (12/05).
+          - For each row containing a BUY or SELL token, walk the words left-to-right and
+            collect (index, value, has_decimal) for every numeric.
+          - Rate = the right-most decimal numeric (the price column is conventionally last).
+            Fallback: the right-most numeric if none have a decimal.
+          - Quantity = the nearest INTEGER numeric immediately to the left of the rate.
+            Fallback: the right-most numeric to the left of the rate, regardless of type.
+        This avoids picking an order-ID just because it happens to be the largest integer.
+        """
+        trades = []
+        considered = 0
+        skipped_reasons = []
+        for row_idx, row in enumerate(rows):
+            tokens = [w["text"] for w in row]
+            joined = " ".join(tokens)
+            upper = joined.upper()
+            if "BUY" not in upper and "SELL" not in upper:
+                continue
+            considered += 1
+            direction = "BUY" if "BUY" in upper else "SELL"
+
+            numerics = []  # list of (token_index, cleaned_str, float_value, has_decimal)
+            for i, tok in enumerate(tokens):
+                if _looks_like_time_or_date(tok):
+                    continue
+                cleaned = _strip_number_token(tok)
+                if cleaned is None:
+                    continue
+                try:
+                    value = float(cleaned)
+                except ValueError:
+                    continue
+                numerics.append((i, cleaned, value, "." in cleaned))
+
+            if len(numerics) < 2:
+                skipped_reasons.append(f"row {row_idx}: only {len(numerics)} numeric token(s)")
+                continue
+
+            # Pick the rate: right-most decimal-looking number, else right-most number.
+            rate_entry = None
+            for entry in reversed(numerics):
+                if entry[3]:  # has_decimal
+                    rate_entry = entry
+                    break
+            if rate_entry is None:
+                rate_entry = numerics[-1]
+
+            rate_pos = rate_entry[0]
+            # Pick the quantity: nearest integer to the LEFT of the rate.
+            quantity_entry = None
+            for entry in reversed(numerics):
+                if entry[0] >= rate_pos:
+                    continue
+                if not entry[3]:  # integer-looking
+                    quantity_entry = entry
+                    break
+            if quantity_entry is None:
+                # No integer to the left; fall back to any numeric to the left.
+                for entry in reversed(numerics):
+                    if entry[0] < rate_pos:
+                        quantity_entry = entry
+                        break
+
+            if quantity_entry is None:
+                skipped_reasons.append(f"row {row_idx}: no quantity column to the left of rate")
+                continue
+
+            try:
+                quantity = int(quantity_entry[2])
+                rate = float(rate_entry[2])
+            except (ValueError, TypeError):
+                skipped_reasons.append(f"row {row_idx}: numeric conversion failed")
+                continue
+
+            if quantity <= 0 or rate <= 0:
+                skipped_reasons.append(f"row {row_idx}: invalid qty/rate ({quantity}, {rate})")
+                continue
+
+            trades.append({
+                "direction": direction,
+                "quantity": quantity,
+                "rate": rate,
+                "source_line": joined,
+            })
+
+        if log:
+            if trades:
+                log.add("parse", "ok",
+                        f"Tabular parser kept {len(trades)} trade(s) from {considered} BUY/SELL row(s)")
+            else:
+                log.add("parse", "warn",
+                        f"Tabular parser found {considered} BUY/SELL row(s) but kept 0",
+                        detail="\n".join(skipped_reasons[:20]))
+        return trades
+
+    # ------------------------------------------------------------------ legacy fallback parser
+
     def parse_trading_data(self, text):
-        """Parse trading data from extracted text"""
+        """Legacy line-based parser kept as a fallback when the tabular path finds nothing.
+
+        Fixes vs original:
+          * supports thousands-separated numbers (1,000.50)
+          * skips obvious time/date tokens
+          * positional rule: rate = right-most decimal numeric, quantity = integer numeric
+            immediately to the left of the rate (avoids picking up an order ID).
+        """
         if not text:
             return []
-        
+
         trades = []
-        lines = text.strip().split('\n')
-        
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            i += 1
-            
+        lines = text.strip().split("\n")
+        num_re = re.compile(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?")
+
+        for idx, raw_line in enumerate(lines):
+            line = raw_line.strip()
             if not line:
                 continue
-            
-            # Look for lines containing BUY or SELL
-            if 'BUY' in line.upper() or 'SELL' in line.upper():
-                # Extract direction
-                direction = 'BUY' if 'BUY' in line.upper() else 'SELL'
-                
-                # Try to extract numbers from this line
-                numbers = re.findall(r'\d+\.?\d*', line)
-                
-                if len(numbers) >= 2:
-                    try:
-                        quantity = int(float(numbers[0]))
-                        market_rate = float(numbers[1])
-                        
-                        if quantity > 0 and market_rate > 0:
-                            trades.append({
-                                'direction': direction,
-                                'quantity': quantity,
-                                'rate': market_rate,
-                                'source_line': line
-                            })
-                    except (ValueError, IndexError):
-                        pass
-            
-            # Alternative format: Look for lines that are just numbers (rates/quantities)
-            # and lines with BUY/SELL separated
-            elif re.match(r'^[\d\s]+$', line.replace('.', '')):
-                # This line contains numbers - check if previous line had BUY/SELL
-                if i >= 2:
-                    prev_line = lines[i-2].upper()
-                    if 'BUY' in prev_line or 'SELL' in prev_line:
-                        direction = 'BUY' if 'BUY' in prev_line else 'SELL'
-                        numbers = re.findall(r'\d+\.?\d*', line)
-                        
-                        if len(numbers) >= 2:
-                            try:
-                                quantity = int(float(numbers[0]))
-                                market_rate = float(numbers[1])
-                                
-                                if quantity > 0 and market_rate > 0:
-                                    trades.append({
-                                        'direction': direction,
-                                        'quantity': quantity,
-                                        'rate': market_rate,
-                                        'source_line': f"{prev_line} | {line}"
-                                    })
-                            except (ValueError, IndexError):
-                                pass
-        
+
+            upper = line.upper()
+            has_direction = "BUY" in upper or "SELL" in upper
+
+            target_line = None
+            direction = None
+            if has_direction:
+                target_line = line
+                direction = "BUY" if "BUY" in upper else "SELL"
+            elif idx > 0:
+                prev_upper = lines[idx - 1].upper()
+                if ("BUY" in prev_upper or "SELL" in prev_upper) and re.fullmatch(r"[\d\s,.]+", line):
+                    target_line = line
+                    direction = "BUY" if "BUY" in prev_upper else "SELL"
+
+            if not target_line:
+                continue
+
+            tokens = target_line.split()
+            numerics = []  # (pos, cleaned, value, has_decimal)
+            for i, tok in enumerate(tokens):
+                if _looks_like_time_or_date(tok):
+                    continue
+                m = num_re.fullmatch(tok.strip("()[]{}$₹€£%"))
+                if not m:
+                    continue
+                cleaned = m.group(0).replace(",", "")
+                try:
+                    value = float(cleaned)
+                except ValueError:
+                    continue
+                numerics.append((i, cleaned, value, "." in cleaned))
+
+            if len(numerics) < 2:
+                continue
+
+            rate_entry = next((e for e in reversed(numerics) if e[3]), numerics[-1])
+            rate_pos = rate_entry[0]
+            quantity_entry = next((e for e in reversed(numerics) if e[0] < rate_pos and not e[3]), None)
+            if quantity_entry is None:
+                quantity_entry = next((e for e in reversed(numerics) if e[0] < rate_pos), None)
+            if quantity_entry is None:
+                continue
+
+            try:
+                quantity = int(quantity_entry[2])
+                rate = float(rate_entry[2])
+            except (ValueError, TypeError):
+                continue
+
+            if quantity > 0 and rate > 0:
+                trades.append({
+                    "direction": direction,
+                    "quantity": quantity,
+                    "rate": rate,
+                    "source_line": target_line,
+                })
+
         return trades
-    
-    def process_image(self, image_path):
-        """Process a single image and extract trading data"""
-        print(f"Processing: {image_path}")
-        
-        text = self.extract_text_from_image(image_path)
-        if not text:
-            print(f"  ⚠ Could not extract text from image")
-            return 0
-        
-        trades = self.parse_trading_data(text)
+
+    # ------------------------------------------------------------------ orchestrator
+
+    def extract_with_steps(self, image_path, echo=True):
+        """Full pipeline for one image. Returns (trades, steps_list)."""
+        log = StepLog(echo=echo, prefix=f"{Path(image_path).name}: ")
+        log.add("start", "info", f"Begin processing {image_path}")
+
+        raw_text, words = self.run_ocr(image_path, log=log)
+        if not raw_text and not words:
+            log.add("done", "error", "Stopped: OCR produced no text")
+            return [], log.entries
+
+        rows = self.build_table_rows(words, log=log)
+        trades = self.parse_trades_from_rows(rows, log=log) if rows else []
+
         if not trades:
-            print(f"  ⚠ Could not parse trading data from text")
-            return 0
-        
-        print(f"  ✓ Found {len(trades)} trades")
-        
-        # Store trades with document info
+            log.add("parse", "info", "Falling back to line-based parser")
+            trades = self.parse_trading_data(raw_text)
+            if trades:
+                log.add("parse", "ok", f"Fallback parser kept {len(trades)} trade(s)")
+            else:
+                log.add("parse", "warn", "Fallback parser also kept 0 trade(s)",
+                        detail=raw_text[:1200])
+
+        log.add("done", "ok" if trades else "warn",
+                f"Finished with {len(trades)} trade(s)")
+        return trades, log.entries
+
+    def process_image(self, image_path):
+        """Process a single image and extract trading data (uses the new step pipeline)."""
+        print(f"Processing: {image_path}")
+        trades, steps = self.extract_with_steps(image_path, echo=True)
+
         doc_name = Path(image_path).stem
+        self.steps_by_doc[doc_name] = steps
+
+        if not trades:
+            return 0
+
         self.documents[doc_name] = trades
         self.trading_data.extend(trades)
-        
         return len(trades)
     
     def process_images(self, image_paths):

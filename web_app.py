@@ -28,6 +28,9 @@ PDF_EXTENSIONS = {".pdf"}
 ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | PDF_EXTENSIONS
 MAX_FILES_PER_REQUEST = 7
 MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "12"))
+# Target DPI for PDF -> image rendering. ~200 dpi is enough for OCR and far cheaper than
+# the previous hard-coded zoom=2 on already-large pages.
+PDF_RENDER_DPI = int(os.environ.get("PDF_RENDER_DPI", "200"))
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
@@ -282,6 +285,71 @@ PAGE = """
       display: none;
     }
 
+    .step-log {
+      margin-top: 12px;
+      padding: 0;
+      list-style: none;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfd;
+      overflow: hidden;
+    }
+
+    .step-log li {
+      display: grid;
+      grid-template-columns: 28px 1fr auto;
+      gap: 8px;
+      padding: 8px 12px;
+      border-top: 1px solid var(--line);
+      font-size: 13px;
+      align-items: start;
+    }
+
+    .step-log li:first-child {
+      border-top: 0;
+    }
+
+    .step-log .step-icon {
+      font-weight: 700;
+      font-family: Consolas, "Courier New", monospace;
+      line-height: 1.4;
+    }
+
+    .step-log .step-name {
+      font-weight: 700;
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin-right: 6px;
+    }
+
+    .step-log .step-time {
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+    }
+
+    .step-log .step-detail {
+      grid-column: 2 / 4;
+      margin: 4px 0 0;
+      padding: 6px 8px;
+      background: #f1f4f7;
+      border-radius: 4px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      color: var(--ink);
+      max-height: 160px;
+      overflow: auto;
+    }
+
+    .step-log .ok    .step-icon { color: var(--buy); }
+    .step-log .warn  .step-icon { color: #b25f00; }
+    .step-log .error .step-icon { color: var(--sell); }
+    .step-log .info  .step-icon { color: var(--accent); }
+
     @media (max-width: 560px) {
       .summary-grid {
         grid-template-columns: 1fr;
@@ -305,6 +373,20 @@ PAGE = """
         <section class="debug">
           <h3>{{ item.name }}</h3>
           <p>{{ item.message }}</p>
+          {% if item.steps %}
+            <ul class="step-log">
+              {% for step in item.steps %}
+                <li class="{{ step.status }}">
+                  <span class="step-icon">{% if step.status == 'ok' %}✓{% elif step.status == 'warn' %}!{% elif step.status == 'error' %}x{% else %}·{% endif %}</span>
+                  <span><span class="step-name">{{ step.step }}</span>{{ step.message }}</span>
+                  <span class="step-time">{{ step.elapsed_ms or 0 }} ms</span>
+                  {% if step.detail %}
+                    <pre class="step-detail">{{ step.detail }}</pre>
+                  {% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
           {% if item.text %}
             <pre>{{ item.text }}</pre>
           {% endif %}
@@ -376,6 +458,21 @@ PAGE = """
             </div>
           </div>
 
+          {% if document.steps %}
+            <ul class="step-log">
+              {% for step in document.steps %}
+                <li class="{{ step.status }}">
+                  <span class="step-icon">{% if step.status == 'ok' %}✓{% elif step.status == 'warn' %}!{% elif step.status == 'error' %}x{% else %}·{% endif %}</span>
+                  <span><span class="step-name">{{ step.step }}</span>{{ step.message }}</span>
+                  <span class="step-time">{{ step.elapsed_ms or 0 }} ms</span>
+                  {% if step.detail %}
+                    <pre class="step-detail">{{ step.detail }}</pre>
+                  {% endif %}
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+
           <div class="table-wrap">
             <table>
               <thead>
@@ -435,6 +532,28 @@ PAGE = """
         .replaceAll("'", "&#039;");
     }
 
+    function statusIcon(status) {
+      switch (status) {
+        case "ok": return "&#10003;";
+        case "warn": return "!";
+        case "error": return "x";
+        default: return "&middot;";
+      }
+    }
+
+    function renderStepList(steps) {
+      if (!steps || !steps.length) return "";
+      const items = steps.map((step) => `
+        <li class="${escapeHtml(step.status || "info")}">
+          <span class="step-icon">${statusIcon(step.status)}</span>
+          <span><span class="step-name">${escapeHtml(step.step || "")}</span>${escapeHtml(step.message || "")}</span>
+          <span class="step-time">${Number(step.elapsed_ms || 0)} ms</span>
+          ${step.detail ? `<pre class="step-detail">${escapeHtml(step.detail)}</pre>` : ""}
+        </li>
+      `).join("");
+      return `<ul class="step-log">${items}</ul>`;
+    }
+
     function renderDocument(doc) {
       const rows = doc.trades.map((trade) => `
         <tr>
@@ -463,6 +582,7 @@ PAGE = """
             <strong>${escapeHtml(doc.count)}</strong>
           </div>
         </div>
+        ${renderStepList(doc.steps)}
         <div class="table-wrap">
           <table>
             <thead>
@@ -486,6 +606,7 @@ PAGE = """
       wrapper.className = "debug";
       const details = diagnostics.map((item) => `
         <p>${escapeHtml(item.message)}</p>
+        ${renderStepList(item.steps)}
         ${item.text ? `<pre>${escapeHtml(item.text)}</pre>` : ""}
       `).join("");
       wrapper.innerHTML = `<h3>${escapeHtml(fileName)}</h3>${details || "<p>No rows found.</p>"}`;
@@ -567,7 +688,7 @@ def is_pdf_file(filename):
     return Path(filename).suffix.lower() in PDF_EXTENSIONS
 
 
-def render_pdf_to_images(pdf_path, output_dir, password=""):
+def render_pdf_to_images(pdf_path, output_dir, password="", pdf_steps=None):
     image_paths = []
     document = fitz.open(pdf_path)
 
@@ -581,14 +702,29 @@ def render_pdf_to_images(pdf_path, output_dir, password=""):
         if document.page_count > MAX_PDF_PAGES:
             raise ValueError(f"PDF has {document.page_count} pages. Upload {MAX_PDF_PAGES} pages or fewer at a time.")
 
-        zoom = 2.0
+        # PyMuPDF default is 72 dpi; compute zoom so the rendered raster is ~PDF_RENDER_DPI dpi.
+        zoom = max(1.0, PDF_RENDER_DPI / 72.0)
         matrix = fitz.Matrix(zoom, zoom)
+        if pdf_steps is not None:
+            pdf_steps.append({
+                "step": "pdf-render",
+                "status": "info",
+                "message": f"Rendering {document.page_count} page(s) at ~{PDF_RENDER_DPI} dpi (zoom={zoom:.2f})",
+                "detail": "",
+            })
         for page_index in range(document.page_count):
             page = document.load_page(page_index)
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)
             image_path = output_dir / f"{pdf_path.stem}_page_{page_index + 1}.png"
             pixmap.save(image_path)
             image_paths.append(image_path)
+            if pdf_steps is not None:
+                pdf_steps.append({
+                    "step": "pdf-render",
+                    "status": "ok",
+                    "message": f"Page {page_index + 1}/{document.page_count} -> {image_path.name} ({pixmap.width}x{pixmap.height})",
+                    "detail": "",
+                })
     finally:
         document.close()
 
@@ -609,6 +745,7 @@ def build_results(extractor):
                 "buy_total": buy_total,
                 "sell_total": sell_total,
                 "count": len(trades),
+                "steps": extractor.steps_by_doc.get(doc_name, []),
             }
         )
 
@@ -629,25 +766,20 @@ def process_uploaded_images(image_paths):
 
     for image_path in image_paths:
         doc_name = Path(image_path).stem
-        text = extractor.extract_text_from_image(image_path)
+        trades, steps = extractor.extract_with_steps(image_path, echo=True)
+        extractor.steps_by_doc[doc_name] = steps
 
-        if not text:
-            diagnostics.append(
-                {
-                    "name": doc_name,
-                    "message": "OCR could not read any text from this image.",
-                    "text": "",
-                }
-            )
-            continue
-
-        trades = extractor.parse_trading_data(text)
         if not trades:
+            # Find the most informative step for the diagnostic message
+            failure = next((s for s in reversed(steps) if s["status"] in ("error", "warn")), None)
+            message = failure["message"] if failure else "No trading data could be extracted from this file."
+            detail_text = failure.get("detail", "") if failure else ""
             diagnostics.append(
                 {
                     "name": doc_name,
-                    "message": "OCR read text, but no BUY/SELL rows matched the parser.",
-                    "text": text.strip()[:3000],
+                    "message": message,
+                    "text": detail_text,
+                    "steps": steps,
                 }
             )
             continue
@@ -700,9 +832,10 @@ def process_image_api():
             uploaded_path = temp_path / original_name
             uploaded_file.save(uploaded_path)
 
+            pdf_steps = []
             if is_pdf_file(original_name):
                 try:
-                    image_paths = render_pdf_to_images(uploaded_path, temp_path, pdf_password)
+                    image_paths = render_pdf_to_images(uploaded_path, temp_path, pdf_password, pdf_steps=pdf_steps)
                 except ValueError as exc:
                     return jsonify(
                         {
@@ -712,6 +845,12 @@ def process_image_api():
                                     "name": original_name,
                                     "message": str(exc),
                                     "text": "",
+                                    "steps": pdf_steps + [{
+                                        "step": "pdf-render",
+                                        "status": "error",
+                                        "message": str(exc),
+                                        "detail": "",
+                                    }],
                                 }
                             ],
                         }
@@ -723,6 +862,14 @@ def process_image_api():
             with redirect_stdout(output_capture), redirect_stderr(output_capture):
                 extractor, diagnostics = process_uploaded_images(image_paths)
 
+            # Prepend PDF rendering steps onto the first document's step log so the UI shows
+            # the full pipeline for that file.
+            if pdf_steps:
+                for diag in diagnostics:
+                    diag["steps"] = pdf_steps + diag.get("steps", [])
+                for doc_name in list(extractor.steps_by_doc.keys()):
+                    extractor.steps_by_doc[doc_name] = pdf_steps + extractor.steps_by_doc[doc_name]
+
             if not extractor.trading_data:
                 captured_output = output_capture.getvalue().strip()
                 if captured_output:
@@ -731,6 +878,7 @@ def process_image_api():
                             "name": "OCR processing log",
                             "message": "Internal messages from image processing.",
                             "text": captured_output[-3000:],
+                            "steps": [],
                         }
                     )
                 return jsonify({"error": "No trading data could be extracted.", "diagnostics": diagnostics}), 422
@@ -777,6 +925,7 @@ def index():
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             image_paths = []
+            pdf_steps_by_file = {}
 
             pdf_password = request.form.get("pdf_password", "")
 
@@ -788,8 +937,12 @@ def index():
                 uploaded_file.save(uploaded_path)
 
                 if is_pdf_file(original_name):
+                    pdf_steps = []
                     try:
-                        image_paths.extend(render_pdf_to_images(uploaded_path, temp_path, pdf_password))
+                        rendered = render_pdf_to_images(uploaded_path, temp_path, pdf_password, pdf_steps=pdf_steps)
+                        image_paths.extend(rendered)
+                        for rendered_path in rendered:
+                            pdf_steps_by_file[Path(rendered_path).stem] = pdf_steps
                     except ValueError as exc:
                         return render_template_string(
                             PAGE,
@@ -799,6 +952,12 @@ def index():
                                     "name": original_name,
                                     "message": str(exc),
                                     "text": "",
+                                    "steps": pdf_steps + [{
+                                        "step": "pdf-render",
+                                        "status": "error",
+                                        "message": str(exc),
+                                        "detail": "",
+                                    }],
                                 }
                             ],
                             max_files=MAX_FILES_PER_REQUEST,
@@ -813,6 +972,17 @@ def index():
             with redirect_stdout(output_capture), redirect_stderr(output_capture):
                 extractor, diagnostics = process_uploaded_images(image_paths)
 
+            # Prepend any PDF render steps onto matching documents
+            if pdf_steps_by_file:
+                for diag in diagnostics:
+                    extra = pdf_steps_by_file.get(diag.get("name"))
+                    if extra:
+                        diag["steps"] = extra + diag.get("steps", [])
+                for doc_name in list(extractor.steps_by_doc.keys()):
+                    extra = pdf_steps_by_file.get(doc_name)
+                    if extra:
+                        extractor.steps_by_doc[doc_name] = extra + extractor.steps_by_doc[doc_name]
+
             if not extractor.trading_data:
                 captured_output = output_capture.getvalue().strip()
                 if captured_output:
@@ -821,6 +991,7 @@ def index():
                             "name": "OCR processing log",
                             "message": "Internal messages from image processing.",
                             "text": captured_output[-3000:],
+                            "steps": [],
                         }
                     )
 
