@@ -16,6 +16,7 @@ import tempfile
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request
+import pytesseract
 from werkzeug.utils import secure_filename
 
 from trading_data_analyzer import TradingDataExtractor
@@ -372,6 +373,7 @@ PAGE = """
                   <th class="number">Quantity</th>
                   <th class="number">Market Rate</th>
                   <th class="number">Calculated Value</th>
+                  <th>OCR Line</th>
                 </tr>
               </thead>
               <tbody>
@@ -381,6 +383,7 @@ PAGE = """
                     <td class="number">{{ trade.quantity }}</td>
                     <td class="number">{{ "%.4f"|format(trade.rate) }}</td>
                     <td class="number">{{ "%.4f"|format(trade.calculated) }}</td>
+                    <td>{{ trade.source_line or "" }}</td>
                   </tr>
                 {% endfor %}
               </tbody>
@@ -427,6 +430,7 @@ PAGE = """
           <td class="number">${escapeHtml(trade.quantity)}</td>
           <td class="number">${formatNumber(trade.rate)}</td>
           <td class="number">${formatNumber(trade.calculated)}</td>
+          <td>${escapeHtml(trade.source_line || "")}</td>
         </tr>
       `).join("");
 
@@ -455,6 +459,7 @@ PAGE = """
                 <th class="number">Quantity</th>
                 <th class="number">Market Rate</th>
                 <th class="number">Calculated Value</th>
+                <th>OCR Line</th>
               </tr>
             </thead>
             <tbody>${rows}</tbody>
@@ -610,7 +615,15 @@ def process_uploaded_images(image_paths):
 
 @app.route("/health")
 def health():
-    return {"status": "ok"}
+    try:
+        tesseract_version = str(pytesseract.get_tesseract_version())
+    except Exception as exc:
+        tesseract_version = f"unavailable: {exc}"
+
+    return {
+        "status": "ok",
+        "tesseract_version": tesseract_version,
+    }
 
 
 @app.route("/api/process-image", methods=["POST"])

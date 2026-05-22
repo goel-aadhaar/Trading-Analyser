@@ -128,7 +128,8 @@ class TradingDataExtractor:
                             trades.append({
                                 'direction': direction,
                                 'quantity': quantity,
-                                'rate': market_rate
+                                'rate': market_rate,
+                                'source_line': line
                             })
                     except (ValueError, IndexError):
                         pass
@@ -152,7 +153,8 @@ class TradingDataExtractor:
                                     trades.append({
                                         'direction': direction,
                                         'quantity': quantity,
-                                        'rate': market_rate
+                                        'rate': market_rate,
+                                        'source_line': f"{prev_line} | {line}"
                                     })
                             except (ValueError, IndexError):
                                 pass
